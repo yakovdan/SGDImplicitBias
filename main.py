@@ -30,41 +30,59 @@ def imshow(img: torch.Tensor) -> None:
     return
 
 
-def calculate_conv_weights_rank(np_weights: np.ndarray, tol=0.001) -> float:
-    np_weights = np_weights.reshape((np_weights.shape[0], -1))
-    m = np_weights / np.linalg.norm(np_weights, ord=2)
-    u, s, vh = np.linalg.svd(m)
-    result = (np.abs(s) > tol).sum()
+def calculate_conv_weights_rank(weights_tensor: torch.Tensor, tol=0.001) -> float:
+    weights_tensor = weights_tensor.reshape((weights_tensor.shape[0], -1))
+    singular_values = torch.linalg.svdvals(weights_tensor)
+    singular_values[1:] /= singular_values[0]  # equivalent to division by matrix 2-norm
+    singular_values[0] = 1
+    result = (singular_values > tol).sum().item()
     return result
 
 
 def calculate_average_conv_rank(model: nn.Module, tol=0.001) -> float:
     parameter_count = len(list(model.parameters()))
     named_params = list(model.named_parameters())
-    conv_weight_indices = []
+    weights = []
     for i in range(parameter_count):
-        if 'conv' in named_params[i][0] and 'bn' in named_params[i + 1][0] and named_params[i][1].shape[0] == \
-                named_params[i + 1][1].shape[0]:
-            conv_weight_indices.append(i)
-    print(len(conv_weight_indices))
-    fused_weights: list[np.ndarray] = []
-    for i in conv_weight_indices:
-        conv_weight = np.copy(named_params[i][1].detach().cpu().numpy())
-        bn_weight = np.copy(named_params[i+1][1].detach().cpu().numpy())[:, None, None, None]
-        fused_weight: np.ndarray = conv_weight * bn_weight
-        fused_weights.append(fused_weight)
-    fused_weight_ranks = []
-    for fused_weight in fused_weights:
-        fused_weight_ranks.append(calculate_conv_weights_rank(fused_weight, tol))
-    avg_rank: float = sum(fused_weight_ranks) / len(fused_weight_ranks)
+        if named_params[i][1].ndim == 2:
+            weights.append(named_params[i][1])
+    weight_ranks = []
+    for weight in weights:
+        weight_ranks.append(calculate_conv_weights_rank(weight, tol))
+    avg_rank: float = sum(weight_ranks) / len(weight_ranks)
     return avg_rank
 
 
-EPOCHS: int = 500
-LR: float = 5e-3
-BATCH_SIZE: int = 4
+EPOCHS: int = 10
+LR: float = 0.1
+BATCH_SIZE: int = 32
 PATH: str = './cifar10_resnet_SGD.pth'
-WEIGHT_DECAY: float = 6e-3
+WEIGHT_DECAY: float = 8e-4
+MOMENTUM = 0.9
+
+class MLP_BN_L_H(nn.Module):
+    def __init__(self, L: int, H: int, input_dim: int = 3 * 32**2, bn: bool = True, num_classes=10):
+        super().__init__()
+        layers = [nn.Sequential(nn.Linear(in_features=input_dim, out_features=H),
+                                nn.BatchNorm1d(num_features=H),
+                                nn.ReLU())]
+        for i in range(1, L):
+            layers.append(nn.Sequential(nn.Linear(in_features=H, out_features=H),
+                                        nn.BatchNorm1d(num_features=H),
+                                        nn.ReLU()))
+
+        layers.append(nn.Linear(H, num_classes))
+        self.layers = nn.Sequential(*layers)
+
+        # self.fc = nn.Linear(in_features=input_dim, out_features=H)
+        # self.bn = nn.BatchNorm1d(num_features=H)
+        # self.act = nn.ReLU()
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1)
+        return self.layers(x)
+
+
 
 if __name__ == "__main__":
     print(torch.__version__)
@@ -73,18 +91,29 @@ if __name__ == "__main__":
     trained_resnet: nn.Module = resnet18(weights=ResNet18_Weights.DEFAULT)
     untrained_resnet: nn.Module = resnet18(weights=None, num_classes=10).cuda()
 
-    transform: torchvision.transforms.Compose = transforms.Compose(
+    #model = untrained_resnet
+    mlp_bn_10_100 = MLP_BN_L_H(L=10, H=100)
+    model = mlp_bn_10_100.cuda()
+
+    train_transform: torchvision.transforms.Compose = transforms.Compose(
         [transforms.ToTensor(),
+         transforms.RandomCrop(size=28),
+         transforms.RandomHorizontalFlip(),
+         transforms.RandomRotation(15),
+         transforms.Resize(size=32),
          transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
+    test_transform: torchvision.transforms.Compose = transforms.Compose(
+        [transforms.ToTensor(),
+         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
     train_set: Dataset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                                      download=True, transform=transform)
+                                                      download=True, transform=train_transform)
 
     train_loader: DataLoader = torch.utils.data.DataLoader(train_set, batch_size=BATCH_SIZE,
                                                            shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True
                                                            )
     test_set: Dataset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                                     download=True, transform=transform)
+                                                     download=True, transform=test_transform)
     test_loader: DataLoader = torch.utils.data.DataLoader(test_set, batch_size=BATCH_SIZE,
                                                           shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True)
 
@@ -103,26 +132,26 @@ if __name__ == "__main__":
     print(' '.join(f'{classes[labels[j]]:5s}' for j in range(BATCH_SIZE)))
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(untrained_resnet.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = optim.SGD(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, momentum=MOMENTUM)
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60, 100, 200], gamma=0.1)
     inputs_gpu_train, labels_gpu_train = load_dataset_to_gpu(train_set)
     inputs_gpu_test, labels_gpu_test = load_dataset_to_gpu(test_set)
 
     # train
     for epoch in range(EPOCHS):  # loop over the dataset multiple times
-        untrained_resnet.train()
-        input_indices = torch.randperm(inputs_gpu_train.shape[0], device="cuda").reshape((-1, BATCH_SIZE))
+        model.train()
         running_loss = 0.0
 
-        for i in tqdm(torch.arange(0, input_indices.shape[0])):
-            inputs, labels = inputs_gpu_train[input_indices[i]], labels_gpu_train[input_indices[i]]
+        for i, data in tqdm(enumerate(train_loader), total=50000 // BATCH_SIZE):
+            # get the inputs; data is a list of [inputs, labels]
+            inputs, labels = data[0].cuda(), data[1].cuda()
 
             # zero the parameter gradients
             optimizer.zero_grad()
 
             # forward + backward + optimize
-            outputs = untrained_resnet(inputs)
-            loss = criterion(outputs, labels.flatten())
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
@@ -133,70 +162,61 @@ if __name__ == "__main__":
                 running_loss = 0.0
 
         scheduler.step()
-        untrained_resnet.eval()
+        model.eval()
         correct = 0
         total = 0
 
         # since we're not training, we don't need to calculate the gradients for our outputs
         with torch.no_grad():
-            # calculate outputs by running images through the network
-            outputs = untrained_resnet(inputs_gpu_test)
-            # the class with the highest energy is what we choose as prediction
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels_gpu_test.shape[0]
-            correct += (predicted.reshape((-1, 1)) == labels_gpu_test).sum().item()
+            for data in test_loader:
+                inputs, labels = data[0].cuda(), data[1].cuda()
+                # calculate outputs by running images through the network
+                outputs = model(inputs)
+                # the class with the highest energy is what we choose as prediction
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
 
-            avg_rank = calculate_average_conv_rank(untrained_resnet, tol=0.001)
+            avg_rank = calculate_average_conv_rank(model, tol=0.001)
             print(f"avg rank: {avg_rank}")
         print(f'Accuracy of the network on the 10000 test images: {100 * correct // total} %')
 
     print('Finished Training')
-    torch.save(untrained_resnet.state_dict(), PATH)
+    torch.save(model.state_dict(), PATH)
 
-    #test:
-
-    # dataiter = iter(test_loader)
-    # images, labels = next(dataiter)
-    #
-    # # print images
-    # imshow(torchvision.utils.make_grid(images))
-    # print('GroundTruth: ', ' '.join(f'{classes[labels[j]]:5s}' for j in range(4)))
-
-    untrained_resnet.eval()
-
-    # outputs = untrained_resnet(images.cuda())
-    # _, predicted = torch.max(outputs, 1)
-    #
-    # print('Predicted: ', ' '.join(f'{classes[predicted[j]]:5s}'
-    #                               for j in range(4)))
-
+    #test
+    model.eval()
     correct = 0
     total = 0
     # since we're not training, we don't need to calculate the gradients for our outputs
     with torch.no_grad():
-        # calculate outputs by running images through the network
-        outputs = untrained_resnet(inputs_gpu_test)
-        # the class with the highest energy is what we choose as prediction
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels_gpu_test.shape[0]
-        correct += (predicted.reshape((-1, 1)) == labels_gpu_test).sum().item()
+        for data in test_loader:
+            inputs, labels = data[0].cuda(), data[1].cuda()
+            # calculate outputs by running images through the network
+            outputs = model(inputs)
+            # the class with the highest energy is what we choose as prediction
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
     print(f'Accuracy of the network on the 10000 test images: {100 * correct // total} %')
 
     # prepare to count predictions for each class
+
     correct_pred = {classname: 0 for classname in classes}
     total_pred = {classname: 0 for classname in classes}
 
     # again no gradients needed
     with torch.no_grad():
-        outputs = untrained_resnet(inputs_gpu_test)
-        _, predictions = torch.max(outputs, 1)
-        predictions = predictions.reshape((-1, 1))
-        # collect the correct predictions for each class
-        for i in range(predictions.shape[0]):
-            if labels_gpu_test[i] == predictions[i]:
-                correct_pred[classes[labels_gpu_test[i].item()]] += 1
-            total_pred[classes[labels_gpu_test[i].item()]] += 1
+        for data in test_loader:
+            inputs, labels = data[0].cuda(), data[1].cuda()
+            outputs = model(inputs)
+            _, predictions = torch.max(outputs, 1)
+            # collect the correct predictions for each class
+            for label, prediction in zip(labels, predictions):
+                if label == prediction:
+                    correct_pred[classes[label]] += 1
+                total_pred[classes[label]] += 1
 
     # print accuracy for each class
     for classname, correct_count in correct_pred.items():
